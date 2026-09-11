@@ -32,7 +32,6 @@ from typing import Callable, Optional, Union
 # ===========================================================================
 # CONFIG
 # ===========================================================================
-MODE_LETTER   = "D"
 LAYERS        = 13
 MIN_JUNK_SIZE = 11_392
 MAX_JUNK_SIZE = 11_584
@@ -126,6 +125,36 @@ def parse_eocd(data: bytes, pos: int) -> Optional[dict]:
 # ===========================================================================
 # FAKE EOCD BLOCK BUILDER
 # ===========================================================================
+def _fake_cd_entry(rng: random.Random) -> bytes:
+    """
+    One syntactically well-formed central directory file header (the fixed
+    46-byte record per the ZIP spec) with garbage content but a precisely
+    known total length. A real parser will accept it as entry #1 without
+    complaint -- the giveaway only shows up when it goes looking for
+    entry #2 right after it.
+    """
+    filename_len = rng.randint(4, 20)
+    h = bytearray(46)
+    h[0:4]   = CD_SIG
+    h[4:6]   = rng.randint(0, 63).to_bytes(2, "little")      # version made by
+    h[6:8]   = rng.randint(10, 63).to_bytes(2, "little")     # version needed
+    h[8:10]  = rng.randint(0, 2047).to_bytes(2, "little")    # flags
+    h[10:12] = rng.choice([0, 8]).to_bytes(2, "little")      # compression method
+    h[12:14] = rng.randint(0, 0xFFFF).to_bytes(2, "little")  # mod time
+    h[14:16] = rng.randint(0x21, 0xFFFF).to_bytes(2, "little")  # mod date
+    h[16:20] = os.urandom(4)                                  # CRC-32
+    h[20:24] = rng.randint(0, 1_000_000).to_bytes(4, "little")  # compressed size
+    h[24:28] = rng.randint(0, 1_000_000).to_bytes(4, "little")  # uncompressed size
+    h[28:30] = filename_len.to_bytes(2, "little")
+    h[30:32] = (0).to_bytes(2, "little")   # extra field length
+    h[32:34] = (0).to_bytes(2, "little")   # comment length
+    h[34:36] = (0).to_bytes(2, "little")   # disk number start
+    h[36:38] = (0).to_bytes(2, "little")   # internal attrs
+    h[38:42] = os.urandom(4)               # external attrs
+    h[42:46] = os.urandom(4)               # local header offset
+    return bytes(h) + os.urandom(filename_len)
+
+
 def build_fake_eocd_block(n_fakes: int, rng: random.Random,
                           block_start_offset: int) -> bytes:
     block = bytearray()
@@ -140,24 +169,32 @@ def build_fake_eocd_block(n_fakes: int, rng: random.Random,
             return rng.randint(1000, 3000)
 
     for _ in range(n_fakes):
+        # Real zips lay out [central directory][EOCD] -- CD first, EOCD right
+        # after it. We mirror that ordering exactly so the size/offset math
+        # is genuinely self-consistent, not just plausible-looking: a reader
+        # that trusts the EOCD's arithmetic will confidently locate what
+        # looks like a real central directory. One well-formed-but-garbage
+        # entry parses cleanly, but cd_size is deliberately set larger than
+        # that one entry consumes, so the parser goes looking for a second
+        # entry immediately after it -- landing on plain junk instead of a
+        # signature. That's a guaranteed "bad magic number" failure, the
+        # same signature as an ordinarily corrupted zip, not an EOCD that's
+        # obviously impossible on its face.
+        cd_relative_pos = len(block)
+        cd_absolute_pos = block_start_offset + cd_relative_pos
+        block.extend(_fake_cd_entry(rng))
+        block.extend(os.urandom(rng.randint(16, 64)))
+
         eocd_pos = len(block)
+        cd_size  = eocd_pos - cd_relative_pos
         block.extend(EOCD_SIG)
         block.extend(b"\x00" * 18)
 
-        block.extend(os.urandom(rng.randint(24, 96)))
-
-        cd_relative_pos = len(block)
-        cd_absolute_pos = block_start_offset + cd_relative_pos
-        block.extend(CD_SIG)
-        block.extend(os.urandom(rng.randint(24, 96)))
-
-        block.extend(os.urandom(rng.randint(16, 64)))
-
         block[eocd_pos + 4 : eocd_pos + 6]   = rng.randint(0, 1).to_bytes(2, "little")
         block[eocd_pos + 6 : eocd_pos + 8]   = rng.randint(0, 1).to_bytes(2, "little")
-        block[eocd_pos + 8 : eocd_pos + 10]  = rng.randint(1, 50).to_bytes(2, "little")
-        block[eocd_pos + 10:eocd_pos + 12]   = rng.randint(1, 50).to_bytes(2, "little")
-        block[eocd_pos + 12:eocd_pos + 16]   = rng.randint(20, 300).to_bytes(4, "little")
+        block[eocd_pos + 8 : eocd_pos + 10]  = rng.randint(2, 50).to_bytes(2, "little")
+        block[eocd_pos + 10:eocd_pos + 12]   = rng.randint(2, 50).to_bytes(2, "little")
+        block[eocd_pos + 12:eocd_pos + 16]   = cd_size.to_bytes(4, "little")
         block[eocd_pos + 16:eocd_pos + 20]   = cd_absolute_pos.to_bytes(4, "little")
         comment_len = vary_comment_len()
         block[eocd_pos + 20:eocd_pos + 22]   = comment_len.to_bytes(2, "little")
@@ -537,6 +574,34 @@ def polymorphic_encoder(data: bytes, seed: bytes) -> bytes:
     return bytes(out)
 
 
+def derive_ephemeral_key(seed: bytes) -> bytes:
+    """
+    Multi-stage key derivation that mixes a content-derived seed with
+    entropy that is never recoverable from the seed itself (PID,
+    nanosecond timestamp, fresh os.urandom). Unlike a key derived purely
+    from `seed`, this key cannot be reconstructed by anyone -- even
+    someone who has already recovered the real archive content -- because
+    the ephemeral entropy that fed it only ever existed for this one call.
+    """
+    entropy = f"{os.getpid()}-{time.time_ns()}-{os.urandom(16).hex()}".encode()
+    d1 = hashlib.sha3_512(seed + entropy).digest()
+    d2 = hashlib.blake2b(d1, digest_size=32).digest()
+    d3 = hashlib.shake_256(d2).digest(32)
+
+    rng = random.Random(int.from_bytes(d3[:16], "big"))
+    key = bytearray(d3)
+    mask = rng.randint(1, 255)
+    xor_k = d2[rng.randint(0, len(d2) - 1)]
+    for i in range(len(key)):
+        key[i] ^= mask
+        key[i] ^= xor_k
+        key[i] = ((key[i] << 1) | (key[i] >> 7)) & 0xFF
+    rng.shuffle(key)
+
+    tag = hmac.new(d1, key, hashlib.sha3_256).digest()[:8]
+    return bytes(key) + tag
+
+
 def encrypt_with_chaff(real_data: bytes, seed: bytes) -> bytes:
     rng = random.Random(int.from_bytes(hashlib.blake2b(seed, digest_size=16).digest(), "big"))
     data = bytearray(real_data)
@@ -549,12 +614,12 @@ def encrypt_with_chaff(real_data: bytes, seed: bytes) -> bytes:
         mixed = bytes(a ^ b for a, b in zip(cd, salted))
         data[pos:pos] = mixed
 
-    bk = hashlib.sha3_512(seed).digest()
-    ks = hashlib.shake_256(bk).digest(len(data))
+    secret = derive_ephemeral_key(seed)
+    ks = hashlib.shake_256(secret).digest(len(data))
     enc = bytearray(len(data))
     for i, b in enumerate(data):
         enc[i] = b ^ ks[i]
-    tag = hmac.new(bk, enc, hashlib.blake2s).digest()[:16]
+    tag = hmac.new(secret, enc, hashlib.blake2s).digest()[:16]
     enc.extend(tag)
     return bytes(enc)
 
@@ -780,8 +845,12 @@ def tamper_zip_with_obfuscation(zip_path: str,
     junk_pre  = rng.randint(eff_min, eff_max)
     junk_post = rng.randint(eff_min, eff_max)
 
-    real_header = get_header_sig(content_hash_seed)
-    real_sig    = mutable_signature(b"real_sig", content_hash_seed)
+    header_seed = hashlib.sha3_256(f"{content_hash_seed}-header".encode()).digest()
+    sig_seed    = hashlib.sha3_256(f"{content_hash_seed}-sig".encode()).digest()
+    footer_seed = hashlib.sha3_256(f"{content_hash_seed}-footer".encode()).digest()
+
+    real_header = encrypt_with_chaff(get_header_sig(content_hash_seed), header_seed)
+    real_sig    = encrypt_with_chaff(mutable_signature(b"real_sig", content_hash_seed), sig_seed)
     nonce       = os.urandom(8)
     rwmod_block = (
         SIG_RWMOD + nonce
@@ -793,7 +862,7 @@ def tamper_zip_with_obfuscation(zip_path: str,
     if callback:
         callback("layers", 1.0)
 
-    real_footer  = get_footer_sig(content_hash_seed)
+    real_footer  = encrypt_with_chaff(get_footer_sig(content_hash_seed), footer_seed)
     footer_block = pack_chunk(SIG_FTR, real_footer)
 
     block_start_offset = (
